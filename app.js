@@ -89,6 +89,7 @@ function initSearchModule() {
         const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`;
 
         try {
+            console.log('URL:', directUrl, '||||  ProxyUrl', proxyUrl);
             const response = await fetch(proxyUrl, {
                 headers: { 'User-Agent': 'NutriPortal/1.0' }
             });
