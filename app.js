@@ -48,7 +48,7 @@ async function loadBlock(blockName) {
     }
 }
 
-// ------ Модуль ПОИСКА (Open Food Facts + КБЖУ) ------
+// ------ Модуль ПОИСКА (Open Food Facts + КБЖУ) - УЛУЧШЕННЫЙ ------
 function initSearchModule() {
     const searchInput = document.getElementById('searchInput');
     const searchBtn = document.getElementById('searchBtn');
@@ -57,23 +57,21 @@ function initSearchModule() {
     
     if (!searchBtn) return;
 
+    let currentAbortController = null;
     let currentSearchId = 0;
 
     function showLoader(show) {
         if (loader) loader.style.display = show ? 'flex' : 'none';
     }
+
     function showMessage(text, isError = false) {
         if (!resultsDiv) return;
-        resultsDiv.innerHTML = `<div class="message" style="${isError ? 'background:#fee2e2; color:#b91c1c' : ''}">${escapeHtml(text)}</div>`;
+        resultsDiv.innerHTML = `<div class="message" style="${isError ? 'background:#fee2e2; color:#b91c1c' : 'background:#eef2ff; color:#1e3a8a'}">${escapeHtml(text)}</div>`;
     }
+
     function escapeHtml(str) {
         if (!str) return '';
-        return str.replace(/[&<>]/g, function(m) {
-            if (m === '&') return '&amp;';
-            if (m === '<') return '&lt;';
-            if (m === '>') return '&gt;';
-            return m;
-        });
+        return str.replace(/[&<>]/g, m => m === '&' ? '&amp;' : m === '<' ? '&lt;' : '&gt;');
     }
 
     function renderProducts(products, container) {
@@ -125,42 +123,54 @@ function initSearchModule() {
             return;
         }
 
+        // Отменяем предыдущий запрос, если он ещё выполняется
+        if (currentAbortController) {
+            currentAbortController.abort();
+        }
+
         const searchId = ++currentSearchId;
+        currentAbortController = new AbortController();
+        const { signal } = currentAbortController;
+
         showLoader(true);
         if (resultsDiv) resultsDiv.innerHTML = '';
 
         const encoded = encodeURIComponent(query);
-        const directUrl = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encoded}&search_simple=1&action=process&json=1&lc=ru&page_size=20`;
-        const proxyUrl = `https://api.allorigins.win/raw?url=${encodeURIComponent(directUrl)}`;
+        const url = `https://world.openfoodfacts.org/cgi/search.pl?search_terms=${encoded}&search_simple=1&action=process&json=1&lc=ru&page_size=20`;
 
-        let attempts = 0;
-        const maxAttempts = 2;
+        // Стратегия повторных попыток с увеличивающейся задержкой (без прокси)
+        let attempt = 0;
+        const maxAttempts = 3;
         let success = false;
+        let lastError = null;
 
-        while (attempts < maxAttempts && !success && searchId === currentSearchId) {
-            attempts++;
+        while (attempt < maxAttempts && !success && searchId === currentSearchId) {
+            attempt++;
             try {
-                let response;
-                if (attempts === 1) {
-                    response = await fetch(directUrl, {
-                        headers: { 'User-Agent': 'NutriPortal-App/1.0' }
-                    });
-                } else {
-                    response = await fetch(proxyUrl, {
-                        headers: { 'User-Agent': 'NutriPortal-App/1.0' }
-                    });
+                // Добавляем случайную задержку перед повторным запросом (кроме первой попытки)
+                if (attempt > 1) {
+                    const delay = Math.min(1000 * Math.pow(2, attempt - 2), 5000);
+                    await new Promise(r => setTimeout(r, delay));
+                    if (searchId !== currentSearchId) return;
                 }
 
-                if (!response.ok) throw new Error(`HTTP ${response.status}`);
+                const response = await fetch(url, {
+                    signal,
+                    headers: {
+                        'User-Agent': 'NutriPortal-App/1.0',
+                        'Accept': 'application/json'
+                    },
+                    cache: 'no-cache' // отключаем кэширование браузера
+                });
 
-                let data;
-                if (attempts === 2) {
-                    const text = await response.text();
-                    data = JSON.parse(text);
-                } else {
-                    data = await response.json();
+                if (!response.ok) {
+                    if (response.status === 503 || response.status === 429) {
+                        throw new Error(`Server busy (${response.status})`);
+                    }
+                    throw new Error(`HTTP ${response.status}`);
                 }
 
+                const data = await response.json();
                 if (searchId !== currentSearchId) return;
 
                 let products = data?.products || [];
@@ -169,25 +179,33 @@ function initSearchModule() {
 
                 if (!resultsDiv || !document.body.contains(resultsDiv)) return;
 
-                if (valid.length === 0) showMessage('Ничего не найдено');
-                else renderProducts(valid, resultsDiv);
-
+                if (valid.length === 0) {
+                    showMessage('Ничего не найдено');
+                } else {
+                    renderProducts(valid, resultsDiv);
+                }
                 success = true;
             } catch (err) {
-                console.warn(`Попытка ${attempts} не удалась:`, err);
-                if (searchId !== currentSearchId) return;
-
-                if (attempts === maxAttempts) {
-                    let msg = 'Ошибка загрузки данных. Проверьте соединение.';
-                    if (err.message.includes('503')) msg = 'Сервер временно недоступен (503). Попробуйте позже.';
-                    else if (err.message.includes('Failed to fetch')) msg = 'Нет соединения с сервером.';
-                    showMessage(msg, true);
-                } else {
-                    await new Promise(r => setTimeout(r, 1000));
+                if (err.name === 'AbortError') {
+                    // Запрос отменён пользователем – выходим
+                    return;
                 }
+                lastError = err;
+                console.warn(`Попытка ${attempt} не удалась:`, err.message);
+                if (searchId !== currentSearchId) return;
             }
         }
-        if (searchId === currentSearchId) showLoader(false);
+
+        if (searchId === currentSearchId) {
+            showLoader(false);
+            if (!success && lastError) {
+                let msg = 'Не удалось загрузить данные. Проверьте соединение.';
+                if (lastError.message.includes('503') || lastError.message.includes('429')) {
+                    msg = 'Сервер временно перегружен. Попробуйте через минуту.';
+                }
+                showMessage(msg, true);
+            }
+        }
     }
 
     searchBtn.addEventListener('click', performSearch);
